@@ -1,19 +1,19 @@
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from groq import Groq
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-import re, os, json, sqlite3, httpx
+import re, os, json, sqlite3, httpx, csv, io
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="Find Your YT Way", version="4.0.0")
+app = FastAPI(title="Find Your YT Way", version="5.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
@@ -27,7 +27,6 @@ client = Groq(api_key=GROQ_API_KEY)
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/login")
 
-# ── Database ──────────────────────────────────────────────────────
 DB_PATH = os.path.join(os.path.dirname(__file__), "database.db")
 
 def init_db():
@@ -38,6 +37,8 @@ def init_db():
         name TEXT NOT NULL,
         email TEXT UNIQUE NOT NULL,
         password TEXT NOT NULL,
+        avatar_emoji TEXT DEFAULT '🎬',
+        notifications_enabled INTEGER DEFAULT 1,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS watch_history (
@@ -64,6 +65,15 @@ def init_db():
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )""")
     conn.commit()
+    # Add new columns if upgrading
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN avatar_emoji TEXT DEFAULT '🎬'")
+        conn.commit()
+    except: pass
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN notifications_enabled INTEGER DEFAULT 1")
+        conn.commit()
+    except: pass
     conn.close()
 
 init_db()
@@ -73,7 +83,6 @@ def get_db():
     conn.row_factory = sqlite3.Row
     return conn
 
-# ── Auth ──────────────────────────────────────────────────────────
 def hash_password(p): return pwd_context.hash(p)
 def verify_password(p, h): return pwd_context.verify(p, h)
 
@@ -97,7 +106,6 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-# ── YouTube Channel Info ──────────────────────────────────────────
 def get_channel_info(video_id: str):
     try:
         url = f"https://www.googleapis.com/youtube/v3/videos?part=snippet&id={video_id}&key={YOUTUBE_API_KEY}"
@@ -105,54 +113,24 @@ def get_channel_info(video_id: str):
         data = res.json()
         if data.get("items"):
             snippet = data["items"][0]["snippet"]
-            return {
-                "channel_id": snippet.get("channelId", ""),
-                "channel_name": snippet.get("channelTitle", "Unknown Channel")
-            }
-    except Exception:
-        pass
+            return {"channel_id": snippet.get("channelId", ""), "channel_name": snippet.get("channelTitle", "Unknown")}
+    except: pass
     return {"channel_id": "", "channel_name": "Unknown Channel"}
 
-# ── Track Watch History ───────────────────────────────────────────
 def track_video(user_id, video_id, video_title, thumbnail_url, channel_id, channel_name):
     conn = get_db()
     now = datetime.utcnow().isoformat()
-
-    existing = conn.execute(
-        "SELECT * FROM watch_history WHERE user_id=? AND video_id=?",
-        (user_id, video_id)
-    ).fetchone()
-
-    # Count how many videos from this channel user has watched
-    channel_count = conn.execute(
-        "SELECT COUNT(DISTINCT video_id) FROM watch_history WHERE user_id=? AND channel_id=?",
-        (user_id, channel_id)
-    ).fetchone()[0]
-
+    existing = conn.execute("SELECT * FROM watch_history WHERE user_id=? AND video_id=?", (user_id, video_id)).fetchone()
+    channel_count = conn.execute("SELECT COUNT(DISTINCT video_id) FROM watch_history WHERE user_id=? AND channel_id=?", (user_id, channel_id)).fetchone()[0]
     if existing:
-        new_video_count = existing["video_analyze_count"] + 1
-        # Auto favourite if same channel watched 3+ times OR same video analyzed 3+ times
-        is_fav = 1 if (channel_count >= FAVOURITE_THRESHOLD or new_video_count >= FAVOURITE_THRESHOLD) else existing["is_favourite"]
-        conn.execute("""
-            UPDATE watch_history
-            SET video_analyze_count=?, is_favourite=?, last_watched=?,
-                video_title=?, channel_id=?, channel_name=?,
-                channel_analyze_count=?
-            WHERE user_id=? AND video_id=?
-        """, (new_video_count, is_fav, now, video_title,
-              channel_id, channel_name, channel_count + 1,
-              user_id, video_id))
+        new_count = existing["video_analyze_count"] + 1
+        is_fav = 1 if (channel_count >= FAVOURITE_THRESHOLD or new_count >= FAVOURITE_THRESHOLD) else existing["is_favourite"]
+        conn.execute("UPDATE watch_history SET video_analyze_count=?, is_favourite=?, last_watched=?, video_title=?, channel_id=?, channel_name=?, channel_analyze_count=? WHERE user_id=? AND video_id=?",
+            (new_count, is_fav, now, video_title, channel_id, channel_name, channel_count + 1, user_id, video_id))
     else:
-        # New video — check if channel already has 3+ videos watched
         is_fav = 1 if channel_count + 1 >= FAVOURITE_THRESHOLD else 0
-        conn.execute("""
-            INSERT INTO watch_history
-            (user_id, video_id, video_title, thumbnail_url, channel_id, channel_name,
-             channel_analyze_count, video_analyze_count, is_favourite, last_watched, first_watched)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
-        """, (user_id, video_id, video_title, thumbnail_url,
-              channel_id, channel_name, channel_count + 1, is_fav, now, now))
-
+        conn.execute("INSERT INTO watch_history (user_id, video_id, video_title, thumbnail_url, channel_id, channel_name, channel_analyze_count, video_analyze_count, is_favourite, last_watched, first_watched) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
+            (user_id, video_id, video_title, thumbnail_url, channel_id, channel_name, channel_count + 1, is_fav, now, now))
     conn.commit()
     conn.close()
     return {"channel_count": channel_count + 1, "is_favourite": is_fav}
@@ -177,7 +155,19 @@ class QuestionRequest(BaseModel):
     question: str
     chat_history: list = []
 
-# ── Helpers ───────────────────────────────────────────────────────
+class UpdateNameRequest(BaseModel):
+    name: str
+
+class UpdatePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+class UpdateAvatarRequest(BaseModel):
+    avatar_emoji: str
+
+class UpdateNotificationsRequest(BaseModel):
+    enabled: bool
+
 def extract_video_id(url):
     patterns = [
         r"(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([^&\n?#]+)",
@@ -233,7 +223,7 @@ def signup(req: SignupRequest):
     conn.commit()
     conn.close()
     token = create_token({"sub": req.email.lower().strip()})
-    return {"token": token, "name": req.name.strip(), "email": req.email.lower().strip()}
+    return {"token": token, "name": req.name.strip(), "email": req.email.lower().strip(), "avatar_emoji": "🎬"}
 
 @app.post("/api/login")
 def login(req: LoginRequest):
@@ -243,22 +233,85 @@ def login(req: LoginRequest):
     if not user or not verify_password(req.password, user["password"]):
         raise HTTPException(status_code=401, detail="Invalid email or password.")
     token = create_token({"sub": req.email.lower().strip()})
-    return {"token": token, "name": user["name"], "email": user["email"]}
+    return {"token": token, "name": user["name"], "email": user["email"], "avatar_emoji": user["avatar_emoji"] or "🎬"}
 
 @app.get("/api/me")
 def get_me(current_user: dict = Depends(get_current_user)):
-    return {"name": current_user["name"], "email": current_user["email"]}
+    return {"name": current_user["name"], "email": current_user["email"], "avatar_emoji": current_user.get("avatar_emoji", "🎬"), "notifications_enabled": current_user.get("notifications_enabled", 1)}
+
+@app.put("/api/settings/name")
+def update_name(req: UpdateNameRequest, current_user: dict = Depends(get_current_user)):
+    if not req.name.strip():
+        raise HTTPException(status_code=400, detail="Name cannot be empty.")
+    conn = get_db()
+    conn.execute("UPDATE users SET name=? WHERE id=?", (req.name.strip(), current_user["id"]))
+    conn.commit()
+    conn.close()
+    return {"name": req.name.strip()}
+
+@app.put("/api/settings/password")
+def update_password(req: UpdatePasswordRequest, current_user: dict = Depends(get_current_user)):
+    if not verify_password(req.current_password, current_user["password"]):
+        raise HTTPException(status_code=400, detail="Current password is incorrect.")
+    if len(req.new_password) < 6:
+        raise HTTPException(status_code=400, detail="New password must be at least 6 characters.")
+    conn = get_db()
+    conn.execute("UPDATE users SET password=? WHERE id=?", (hash_password(req.new_password), current_user["id"]))
+    conn.commit()
+    conn.close()
+    return {"message": "Password updated successfully."}
+
+@app.put("/api/settings/avatar")
+def update_avatar(req: UpdateAvatarRequest, current_user: dict = Depends(get_current_user)):
+    conn = get_db()
+    conn.execute("UPDATE users SET avatar_emoji=? WHERE id=?", (req.avatar_emoji, current_user["id"]))
+    conn.commit()
+    conn.close()
+    return {"avatar_emoji": req.avatar_emoji}
+
+@app.put("/api/settings/notifications")
+def update_notifications(req: UpdateNotificationsRequest, current_user: dict = Depends(get_current_user)):
+    conn = get_db()
+    conn.execute("UPDATE users SET notifications_enabled=? WHERE id=?", (1 if req.enabled else 0, current_user["id"]))
+    conn.commit()
+    conn.close()
+    return {"notifications_enabled": req.enabled}
+
+@app.delete("/api/settings/account")
+def delete_account(current_user: dict = Depends(get_current_user)):
+    conn = get_db()
+    conn.execute("DELETE FROM watch_history WHERE user_id=?", (current_user["id"],))
+    conn.execute("DELETE FROM qa_history WHERE user_id=?", (current_user["id"],))
+    conn.execute("DELETE FROM users WHERE id=?", (current_user["id"],))
+    conn.commit()
+    conn.close()
+    return {"message": "Account deleted successfully."}
+
+@app.get("/api/export/history")
+def export_history(current_user: dict = Depends(get_current_user)):
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM qa_history WHERE user_id=? ORDER BY created_at DESC", (current_user["id"],)).fetchall()
+    conn.close()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Date", "Video Title", "Question", "Answer"])
+    for r in rows:
+        writer.writerow([r["created_at"], r["video_title"], r["question"], r["answer"]])
+    output.seek(0)
+    return StreamingResponse(
+        io.BytesIO(output.getvalue().encode()),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=ytway_history.csv"}
+    )
 
 @app.post("/api/load-video")
 def load_video(req: VideoRequest, current_user: dict = Depends(get_current_user)):
     video_id = extract_video_id(req.url)
     if not video_id:
         raise HTTPException(status_code=400, detail="Please enter a valid YouTube URL.")
-
     transcript, lang = get_transcript(video_id)
     channel_info = get_channel_info(video_id)
     thumbnail_url = f"https://img.youtube.com/vi/{video_id}/mqdefault.jpg"
-
     snippet = transcript[:3000]
     try:
         response = client.chat.completions.create(
@@ -276,36 +329,15 @@ def load_video(req: VideoRequest, current_user: dict = Depends(get_current_user)
             text = text[start:end]
         info = json.loads(text)
     except Exception:
-        info = {
-            "title": f"YouTube Video ({video_id})",
-            "suggested_questions": [
-                "What is the main topic?",
-                "Summarize the key points",
-                "What are the takeaways?",
-                "Were any examples given?",
-                "What was the conclusion?"
-            ]
-        }
-
+        info = {"title": f"YouTube Video ({video_id})", "suggested_questions": ["What is the main topic?", "Summarize the key points", "What are the takeaways?", "Were any examples given?", "What was the conclusion?"]}
     video_title = info.get("title", "YouTube Video")
-
-    # Track watch history + auto favourite logic
-    track_result = track_video(
-        current_user["id"], video_id, video_title,
-        thumbnail_url, channel_info["channel_id"], channel_info["channel_name"]
-    )
-
+    track_result = track_video(current_user["id"], video_id, video_title, thumbnail_url, channel_info["channel_id"], channel_info["channel_name"])
     return {
-        "video_id": video_id,
-        "title": video_title,
-        "transcript": transcript,
-        "transcript_length": len(transcript),
-        "language": lang,
+        "video_id": video_id, "title": video_title, "transcript": transcript,
+        "transcript_length": len(transcript), "language": lang,
         "suggested_questions": info.get("suggested_questions", []),
-        "thumbnail_url": thumbnail_url,
-        "channel_name": channel_info["channel_name"],
-        "channel_id": channel_info["channel_id"],
-        "channel_analyze_count": track_result["channel_count"],
+        "thumbnail_url": thumbnail_url, "channel_name": channel_info["channel_name"],
+        "channel_id": channel_info["channel_id"], "channel_analyze_count": track_result["channel_count"],
         "auto_favourited": track_result["is_favourite"] == 1
     }
 
@@ -320,27 +352,17 @@ Rules:
 - Answer ONLY from the transcript
 - If not in transcript say: "This wasn't covered in the video."
 - Be concise, use bullet points for lists"""}]
-
         for msg in req.chat_history[-8:]:
             if msg.get("role") in ["user", "assistant"] and msg.get("content"):
                 messages.append({"role": msg["role"], "content": msg["content"]})
         messages.append({"role": "user", "content": req.question})
-
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=messages,
-            max_tokens=800, temperature=0.5
-        )
+        response = client.chat.completions.create(model="llama-3.3-70b-versatile", messages=messages, max_tokens=800, temperature=0.5)
         answer = response.choices[0].message.content
-
         conn = get_db()
-        conn.execute(
-            "INSERT INTO qa_history (user_id, video_id, video_title, question, answer) VALUES (?, ?, ?, ?, ?)",
-            (current_user["id"], req.video_id, req.video_title, req.question, answer)
-        )
+        conn.execute("INSERT INTO qa_history (user_id, video_id, video_title, question, answer) VALUES (?, ?, ?, ?, ?)",
+            (current_user["id"], req.video_id, req.video_title, req.question, answer))
         conn.commit()
         conn.close()
-
         return {"answer": answer}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI error: {str(e)}")
@@ -348,63 +370,24 @@ Rules:
 @app.get("/api/watch-history")
 def get_watch_history(current_user: dict = Depends(get_current_user)):
     conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM watch_history WHERE user_id=? ORDER BY last_watched DESC LIMIT 50",
-        (current_user["id"],)
-    ).fetchall()
+    rows = conn.execute("SELECT * FROM watch_history WHERE user_id=? ORDER BY last_watched DESC LIMIT 50", (current_user["id"],)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 @app.get("/api/favourites")
 def get_favourites(current_user: dict = Depends(get_current_user)):
     conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM watch_history WHERE user_id=? AND is_favourite=1 ORDER BY last_watched DESC",
-        (current_user["id"],)
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-@app.get("/api/qa-history")
-def get_qa_history(current_user: dict = Depends(get_current_user)):
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM qa_history WHERE user_id=? ORDER BY created_at DESC LIMIT 30",
-        (current_user["id"],)
-    ).fetchall()
+    rows = conn.execute("SELECT * FROM watch_history WHERE user_id=? AND is_favourite=1 ORDER BY last_watched DESC", (current_user["id"],)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 @app.get("/api/stats")
 def get_stats(current_user: dict = Depends(get_current_user)):
     conn = get_db()
-    total_videos = conn.execute(
-        "SELECT COUNT(DISTINCT video_id) FROM watch_history WHERE user_id=?",
-        (current_user["id"],)
-    ).fetchone()[0]
-    total_channels = conn.execute(
-        "SELECT COUNT(DISTINCT channel_id) FROM watch_history WHERE user_id=?",
-        (current_user["id"],)
-    ).fetchone()[0]
-    total_favourites = conn.execute(
-        "SELECT COUNT(*) FROM watch_history WHERE user_id=? AND is_favourite=1",
-        (current_user["id"],)
-    ).fetchone()[0]
-    total_questions = conn.execute(
-        "SELECT COUNT(*) FROM qa_history WHERE user_id=?",
-        (current_user["id"],)
-    ).fetchone()[0]
-    top_channels = conn.execute(
-        """SELECT channel_name, COUNT(DISTINCT video_id) as video_count
-           FROM watch_history WHERE user_id=? AND channel_id != ''
-           GROUP BY channel_id ORDER BY video_count DESC LIMIT 5""",
-        (current_user["id"],)
-    ).fetchall()
+    total_videos = conn.execute("SELECT COUNT(DISTINCT video_id) FROM watch_history WHERE user_id=?", (current_user["id"],)).fetchone()[0]
+    total_channels = conn.execute("SELECT COUNT(DISTINCT channel_id) FROM watch_history WHERE user_id=?", (current_user["id"],)).fetchone()[0]
+    total_favourites = conn.execute("SELECT COUNT(*) FROM watch_history WHERE user_id=? AND is_favourite=1", (current_user["id"],)).fetchone()[0]
+    total_questions = conn.execute("SELECT COUNT(*) FROM qa_history WHERE user_id=?", (current_user["id"],)).fetchone()[0]
+    top_channels = conn.execute("""SELECT channel_name, COUNT(DISTINCT video_id) as video_count FROM watch_history WHERE user_id=? AND channel_id != '' GROUP BY channel_id ORDER BY video_count DESC LIMIT 5""", (current_user["id"],)).fetchall()
     conn.close()
-    return {
-        "total_videos": total_videos,
-        "total_channels": total_channels,
-        "total_favourites": total_favourites,
-        "total_questions": total_questions,
-        "top_channels": [dict(r) for r in top_channels]
-    }
+    return {"total_videos": total_videos, "total_channels": total_channels, "total_favourites": total_favourites, "total_questions": total_questions, "top_channels": [dict(r) for r in top_channels]}
