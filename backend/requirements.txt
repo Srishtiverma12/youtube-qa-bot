@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+youtube-transcript-api
+groq
+python-dotenv
+pydantic
